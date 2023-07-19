@@ -2,14 +2,10 @@
 using PricedX.Utils;
 using PxServices.Interfaces;
 using PxServices.Models;
-using System.Linq;
-using System.Reflection;
-using System.Text;
-using static Org.BouncyCastle.Math.EC.ECCurve;
 
 namespace PxServices.CoreAlgos
 {
-    public class PinBarAlgo : IPinBarAlgo
+    public class PhaseSeriesAlgo : IPhaseSeriesAlgo
     {
         public IDataRetrievalService _dataRetrievalService { get; set; }
         public IHistoricRatioAlgo _historicRatioAlgo { get; set; }
@@ -18,7 +14,7 @@ namespace PxServices.CoreAlgos
         public int _roundCount { get; set; }
 
 
-        public PinBarAlgo(IDataRetrievalService dataRetrievalService, IEngine engine, IHistoricRatioAlgo historicRatioAlgo)
+        public PhaseSeriesAlgo(IDataRetrievalService dataRetrievalService, IEngine engine, IHistoricRatioAlgo historicRatioAlgo)
         {
             _historicRatioAlgo = historicRatioAlgo;
             _dataRetrievalService = dataRetrievalService;
@@ -27,144 +23,178 @@ namespace PxServices.CoreAlgos
             _roundCount = 10;
         }
 
-        public void StartAlgo(PinBarAlgoConfig config)
+        private IList<Point>? Deflate(string mainTicker, string inflationTicker)
         {
-            if (string.IsNullOrEmpty(config.Ticker))
-                return;
-
-            var bars = _dataRetrievalService.GetPinBars(config.Ticker);
-            if (bars.Count < config.WindowSize)
-                return;
-
-
-            var targetBars = bars.TakeLast(config.WindowSize).ToList();
-            RunCore(bars, targetBars, config);
-
-            return;
-            for (int i = config.WindowSize -1; i < bars.Count; i++)
+            var deInflatedPoints = _historicRatioAlgo.GetHistoricRatioSeries(new HistoricRatioArgs()
             {
-                //var targetBars = bars.Take(i+1).TakeLast(config.WindowSize).ToList();
-                //RunCore(bars, targetBars, config);
-            }
+                TickerMain = mainTicker,
+                TickerBenchmark = inflationTicker,
+                IsMtg = false,
+                UseRelativeAvg = false,
+                Scale = false
+            })?.RatioPoints.Select(o => new Point { ClosingPrice = o.Ratio, Date = o.Date }).ToList();
+
+            return deInflatedPoints;
         }
 
-        private void RunCore(IList<PinBar> bars, IList<PinBar> targetBars, PinBarAlgoConfig config)
+        public PhaseSeries GetPhaseSeries(PhaseSeriesArgs args)
         {
-            var targetDifferential = GetPinbarDeltaMap(targetBars, config);
-            var matches = GetMatches(bars, targetDifferential, config, out int matchCount);
-            if (matchCount == 0)
-                return;
+            if (string.IsNullOrEmpty(args.TickerShift) || string.IsNullOrEmpty(args.TickerHistorical))
+                return null;
 
-            decimal? avgMatchDiff = CalcAverageDiff(matches);
-            
-            if(Math.Abs(avgMatchDiff.Value) > 0.25m && matchCount > 10)
+            var seriesShift = new List<PhaseSeriesPoint>();
+            var seriesHistorical = new List<PhaseSeriesPoint>();
+
+            var mtSeries = new PhaseSeries(seriesShift, seriesHistorical);
+
+            var pointsShift = _dataRetrievalService.GetPoints(args.TickerShift);
+            var pointsHistorical = _dataRetrievalService.GetPoints(args.TickerHistorical);
+
+            var deflate = !string.IsNullOrEmpty(args.TickerInflation) && args.TickerInflation.Trim() != "$";
+            if (deflate)
             {
-                string x = "hi";
+                _historicRatioAlgo.SetRoundCount(12);
+                pointsShift = Deflate(args.TickerShift, args.TickerInflation);
+                pointsHistorical = Deflate(args.TickerHistorical, args.TickerInflation);
             }
 
-            return;
-        }
+            if (!pointsShift.Any() || !pointsHistorical.Any())
+                return null;
 
-        private decimal CalcAverageDiff(IList<Tuple<PinBar, PinBar>> matches)
-        {
-            var avgMatchDiff = 0.0m;
-            for (int i = 0; i < matches.Count; i++)
+
+            var originationPointShift = FindOriginationPoint(pointsShift, args.StartDateShift, null, out DateTime? originationDateShift, out DayOfWeek? dayOfWeekShift);
+            var originationPointHistorical = FindOriginationPoint(pointsHistorical, args.StartDateHistorical, dayOfWeekShift, out DateTime? originationDateHistorical, out DayOfWeek? dayOfWeekHistorical);
+
+            if (originationDateShift == null || originationDateHistorical == null)
+                return null;
+
+            var goldenRatio = (1 - args.OffSet) *originationPointShift.ClosingPrice / originationPointHistorical.ClosingPrice;
+
+            ApplyHistoricalScale(pointsHistorical, goldenRatio);
+            ApplyHistoricalShift(pointsShift, originationDateShift.Value, originationDateHistorical.Value);
+
+            var startDate = _dateGetter.GetFirstDate(pointsShift, pointsHistorical);
+            var endDate = _dateGetter.GetLastDate(pointsShift, pointsHistorical);
+
+            var extrapolationMapA = new Dictionary<DateTime, LineModel>();
+            var extrapolationMapB = new Dictionary<DateTime, LineModel>();
+
+            var shiftIndex = new EngineIndex(0);
+            var historicalIndex = new EngineIndex(0);
+
+            var leftBoundDtY = pointsShift.First().Date > pointsHistorical.First().Date ? pointsShift.First().Date : pointsHistorical.First().Date;
+            var leftBoundDtX = leftBoundDtY;
+
+            var foundFirstShiftPoint = false;
+            var foundFirstHistoricalPoint = false;
+            for (var dt = startDate.Date; dt.Date <= endDate.Date; dt = dt.AddDays(1))
             {
-                var match = matches[i];
-
-                var beforeBar = match.Item1;
-                var afterBar = match.Item2;
-
-                var closeDiffPct = (afterBar.Close / beforeBar.Close - 1) * 100.0m;
-
-                if (i == 0)
-                {
-                    avgMatchDiff = closeDiffPct;
+                if (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday)
                     continue;
-                }
 
-                avgMatchDiff = (avgMatchDiff * i + closeDiffPct) / (i + 1);
+                CalculatePhaseSeries(
+                    pointsShift, pointsHistorical, 
+                    extrapolationMapA, extrapolationMapB, dt.Date,
+                    shiftIndex, historicalIndex,
+                    seriesShift, seriesHistorical,
+                    ref foundFirstShiftPoint, ref foundFirstHistoricalPoint,
+                    ref leftBoundDtY, ref leftBoundDtX);
             }
 
-            return avgMatchDiff;
+            if (deflate)
+                ScaleSeries(seriesShift, seriesHistorical);
+
+            return mtSeries;
         }
 
-        private IList<Tuple<PinBar, PinBar>> GetMatches(IList<PinBar> bars, Dictionary<int, PinBarDelta> targetDifferential, PinBarAlgoConfig config, out int matchCount)
+        private void ScaleSeries(IList<PhaseSeriesPoint> seriesShift, IList<PhaseSeriesPoint> seriesHistorical)
         {
-            var queue = new Queue<PinBar>(config.WindowSize);
-            var matches = new List<Tuple<PinBar, PinBar>>();
-            matchCount = 0;
-            for (int i = 0; i < bars.Count; i++)
+            if (!seriesShift.Any())
+                return;
+
+            var scalingFactor = 0;
+            var firstPoint = seriesShift[0];
+
+            var price = firstPoint.Price;
+            while (price < 1.0M)
             {
-                var lastBar = i == 0 ? null : bars[i - 1];
-                var upcomingBar = bars[i];
-                if (queue.Count < config.WindowSize)
-                {
-                    queue.Enqueue(bars[0]);
+                price *= 10;
+                scalingFactor++;
+            }
+
+            // have to do both by same scaling factor
+            foreach (var p in seriesShift)
+            {
+                p.Price = (decimal)Math.Pow(10, scalingFactor) * p.Price;
+            }
+            foreach (var p in seriesHistorical)
+            {
+                p.Price = (decimal)Math.Pow(10, scalingFactor) * p.Price;
+            }
+        }
+
+        private void ApplyHistoricalShift(IList<Point> pointsToShift, DateTime originationDateShift, DateTime originationDateHistorical)
+        {
+            var diffSpan = originationDateShift - originationDateHistorical;
+            foreach (var pointToShift in pointsToShift)
+            {
+                pointToShift.Date = pointToShift.Date.Subtract(diffSpan);
+            }
+        }
+
+        private void CalculatePhaseSeries(
+            IList<Point> pointsShift, IList<Point> pointsHistorical,
+            IDictionary<DateTime, LineModel> dictA, IDictionary<DateTime, LineModel> dictB, DateTime date,
+            EngineIndex shiftIndex, EngineIndex historicalIndex,
+            IList<PhaseSeriesPoint> seriesShift, IList<PhaseSeriesPoint> seriesHistorical,
+            ref bool alreadyFoundFirstShiftPoint, ref bool alreadyFoundFirstHistoricalPoint,
+            ref DateTime leftBoundDtY, ref DateTime leftBoundDtX
+        )
+        {
+            var priceShift = _engine.GetPrice(pointsShift, dictA, date, shiftIndex, ref leftBoundDtY, out bool foundPointShift, out bool isForwardExtrapolationShift);
+            var priceHistorical = _engine.GetPrice(pointsHistorical, dictB, date, historicalIndex, ref leftBoundDtX, out bool foundPointHistorical, out bool isForwardExtrapolationHistorical);
+
+            var mtfPointShift = new PhaseSeriesPoint(Math.Round(priceShift, _roundCount), date);
+            var mtfPointHistorical = new PhaseSeriesPoint(Math.Round(priceHistorical, _roundCount), date);
+
+            if(!alreadyFoundFirstShiftPoint)
+                alreadyFoundFirstShiftPoint = foundPointShift;
+            if(!alreadyFoundFirstHistoricalPoint)
+                alreadyFoundFirstHistoricalPoint = foundPointHistorical;
+
+            if (alreadyFoundFirstShiftPoint && !isForwardExtrapolationShift)
+                seriesShift.Add(mtfPointShift);
+            if (alreadyFoundFirstHistoricalPoint && !isForwardExtrapolationHistorical) 
+                seriesHistorical.Add(mtfPointHistorical);
+        }
+
+        private void ApplyHistoricalScale(IList<Point> points, decimal goldenRatio)
+        {
+            foreach (var point in points)
+            {
+                point.ClosingPrice *= goldenRatio;
+            }
+        }
+
+        private Point FindOriginationPoint(IList<Point> points, DateTime targetDate, DayOfWeek? targetDayOfWeek, out DateTime? actualTargetDate, out DayOfWeek? dayOfWeek)
+        {
+            actualTargetDate = null;
+            dayOfWeek = null;
+            foreach (var point in points)
+            {
+                var date = point.Date;
+                if(date.DayOfWeek == DayOfWeek.Saturday || date.DayOfWeek == DayOfWeek.Sunday)
                     continue;
-                }
 
-                var historicDifferential = GetPinbarDeltaMap(queue.ToList(), config);
-                if (IsWithinTolerance(targetDifferential, historicDifferential, config) && lastBar != null)
+                if (targetDate <= date && (targetDayOfWeek == null || date.DayOfWeek == targetDayOfWeek))
                 {
-                    matchCount++;
-                    matches.Add(new Tuple<PinBar, PinBar>(lastBar, upcomingBar));
+                    actualTargetDate = date;
+                    dayOfWeek = date.DayOfWeek;
+                    return point;
                 }
-
-                queue.Dequeue();
-                queue.Enqueue(upcomingBar);
             }
 
-            return matches;
-        }
-
-        private bool IsWithinTolerance(Dictionary<int, PinBarDelta> targetDeltaMap, Dictionary<int, PinBarDelta> historicDeltaMap, PinBarAlgoConfig config)
-        {
-            var tolerancePct = (decimal)config.Tolerance;
-            foreach(var kv in targetDeltaMap)
-            {
-                if (!historicDeltaMap.ContainsKey(kv.Key))
-                    return false;
-
-                var targetPinBarDelta = kv.Value;
-                var historicPinBarDelta = historicDeltaMap[kv.Key];
-
-                var pctMultiplier = 100.0m;
-
-                var deltaDiffOpen = (targetPinBarDelta.DiffOpen - historicPinBarDelta.DiffOpen) * pctMultiplier;
-                var deltaDiffClose = (targetPinBarDelta.DiffClose - historicPinBarDelta.DiffClose) * pctMultiplier;
-
-                if (Math.Abs(deltaDiffOpen) > tolerancePct || Math.Abs(deltaDiffClose) > tolerancePct)
-                    return false;
-            }
-
-            return true;
-        }
-
-        private Dictionary<int, PinBarDelta> GetPinbarDeltaMap(IList<PinBar> pinBars, PinBarAlgoConfig config)
-        {
-            var deltaMap = new Dictionary<int, PinBarDelta>();
-            for (int i = 1; i< pinBars.Count; i++)
-            {
-                var sourceBar = pinBars[i - 1];
-                var destBar = pinBars[i];
-
-                deltaMap.Add(i, new PinBarDelta()
-                {
-                    DiffOpen = PctDiff(sourceBar.Open, destBar.Open, config),
-                    DiffClose = PctDiff(sourceBar.Close, destBar.Close, config)
-                });
-            }
-
-            return deltaMap;
-        }
-
-        private decimal PctDiff(decimal source, decimal destination, PinBarAlgoConfig config)
-        {
-            var k = config.KeyDiffZeros + 1;
-            var multipler = Math.Pow(10, k - 1);
-            var multipledPct = (int)((destination / source - 1) * 100.0m * (decimal)multipler);
-            return ((decimal)multipledPct / (decimal)Math.Pow(10,k-1));
+            return null;
         }
     }
 }
